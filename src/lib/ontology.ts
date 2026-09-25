@@ -14,12 +14,12 @@ export function parseOntologyFile(fileName: string, text: string): GraphData {
   const ext = fileName.split(".").pop()?.toLowerCase() ?? "";
   if (ext === "json") return parseWebvowlJson(text);
   if (["ttl", "n3", "nt", "rdf", "owl", "xml"].includes(ext)) {
-    return parseRdf(text, ext);
+    return parseRdf(text, ext, fileName);
   }
   // content sniffing fallback
   const t = text.trim();
   if (t.startsWith("{")) return parseWebvowlJson(text);
-  return parseRdf(text, "ttl");
+  return parseRdf(text, "ttl", fileName);
 }
 
 /* ═══════════════════ WebVOWL / OWL2VOWL JSON ═══════════════════ */
@@ -189,7 +189,7 @@ const CONTENT_TYPES: Record<string, string> = {
   xml: "application/rdf+xml",
 };
 
-function parseRdf(text: string, ext: string): GraphData {
+function parseRdf(text: string, ext: string, fileName: string): GraphData {
   const store = $rdf.graph();
   const contentType = CONTENT_TYPES[ext] ?? "text/turtle";
   try {
@@ -232,12 +232,17 @@ function parseRdf(text: string, ext: string): GraphData {
   const objPropUris = new Set<string>();
   const dtPropUris = new Set<string>();
   const equivPairs: Array<[string, string]> = [];
+  /** every URI subject → its rdf:type class URIs (instances AND declarations) */
+  const typeIndex = new Map<string, string[]>();
 
   for (const s of store.statements) {
     if (s.predicate.uri !== RDF_NS + "type" || !isUriNode(s.subject) || !isUriNode(s.object)) {
       continue;
     }
     const subj = s.subject.uri;
+    const arr = typeIndex.get(subj) ?? [];
+    arr.push(s.object.uri);
+    typeIndex.set(subj, arr);
     switch (s.object.uri) {
       case OWL_NS + "Class":
       case RDFS_NS + "Class":
@@ -276,13 +281,56 @@ function parseRdf(text: string, ext: string): GraphData {
     }
   }
 
-  // external detection: namespaces outside the most common class namespace
-  const nsCount = new Map<string, number>();
-  classUris.forEach((u) => {
-    const ns = namespaceOf(u);
-    nsCount.set(ns, (nsCount.get(ns) ?? 0) + 1);
-  });
-  const baseNs = [...nsCount.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] ?? "";
+  // external detection by host: classes whose host differs from the
+  // majority host (declared classes + instanced classes) render as external
+  const hostOf = (u: string): string => {
+    try {
+      return new URL(u).host;
+    } catch {
+      return u;
+    }
+  };
+  /** rdf:type values that describe the schema, not instances */
+  const META_TYPES = new Set([
+    OWL_NS + "Class",
+    OWL_NS + "Thing",
+    OWL_NS + "Nothing",
+    OWL_NS + "NamedIndividual",
+    OWL_NS + "ObjectProperty",
+    OWL_NS + "DatatypeProperty",
+    OWL_NS + "AnnotationProperty",
+    OWL_NS + "Ontology",
+    OWL_NS + "DeprecatedClass",
+    OWL_NS + "DeprecatedProperty",
+    OWL_NS + "FunctionalProperty",
+    OWL_NS + "InverseFunctionalProperty",
+    OWL_NS + "TransitiveProperty",
+    OWL_NS + "SymmetricProperty",
+    OWL_NS + "Restriction",
+    OWL_NS + "AllDisjointClasses",
+    RDFS_NS + "Class",
+    RDFS_NS + "Datatype",
+    RDFS_NS + "Literal",
+    RDF_NS + "Property",
+  ]);
+
+  const instancedClassUris = new Set<string>();
+  typeIndex.forEach((cs) =>
+    cs.forEach((c) => {
+      if (!META_TYPES.has(c)) instancedClassUris.add(c);
+    })
+  );
+  const hostCount = new Map<string, number>();
+  const countHost = (u: string) => {
+    const h = hostOf(u);
+    hostCount.set(h, (hostCount.get(h) ?? 0) + 1);
+  };
+  classUris.forEach(countHost);
+  instancedClassUris.forEach(countHost);
+  const baseHost = [...hostCount.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] ?? "";
+  const baseNs = [...new Set([...classUris, ...instancedClassUris])]
+    .map(namespaceOf)
+    .sort((a, b) => a.length - b.length)[0] ?? "";
 
   // merge equivalent classes: second element folds into first
   const folded = new Map<string, string>(); // foldedUri -> keptUri
@@ -321,7 +369,7 @@ function parseRdf(text: string, ext: string): GraphData {
   classUris.forEach((u) => {
     if (folded.has(u)) return;
     const dep = hasType(u, OWL_NS + "DeprecatedClass");
-    const ext = baseNs && namespaceOf(u) !== baseNs;
+    const ext = baseHost !== "" && hostOf(u) !== baseHost;
     addNode(u, dep ? "deprecated" : ext ? "external" : "class");
   });
   thingUris.forEach((u) => addNode(u, "class"));
@@ -418,17 +466,144 @@ function parseRdf(text: string, ext: string): GraphData {
     addEdge({ source: a, target: b, kind: "disjoint", label: "Disjoint With" });
   }
 
-  // use labels already resolved for nodes referenced by edges only
+  // ── ABox inference: aggregate instance-level links into class-level VOWL
+  //    edges (for data files that contain individuals but no property
+  //    declarations, e.g. PMD material test data) ──
+  const SKIP_PRED_PREFIX = [
+    RDF_NS,
+    RDFS_NS,
+    OWL_NS,
+    "http://purl.org/dc/elements/1.1/",
+    "http://purl.org/dc/terms/",
+  ];
+  const skippedPred = (p: string) => SKIP_PRED_PREFIX.some((ns) => p.startsWith(ns));
+
+  // add nodes for classes that only appear as instance types
+  instancedClassUris.forEach((u) => {
+    if (META_TYPES.has(u)) return;
+    const cu = canonical(u);
+    if (nodeIds.has(cu)) return;
+    const dep = hasType(cu, OWL_NS + "DeprecatedClass");
+    const ext = baseHost !== "" && hostOf(cu) !== baseHost;
+    addNode(cu, dep ? "deprecated" : ext ? "external" : "class");
+  });
+
+  const edgeKey = (e: { kind: string; source: string; target: string; label?: string }) =>
+    `${e.kind}|${e.source}|${e.target}|${e.label ?? ""}`;
+  const edgeKeys = new Set(edges.map(edgeKey));
+  let inferredEdges = 0;
+  const addInferredEdge = (e: Omit<VowlEdge, "id">) => {
+    const k = edgeKey(e);
+    if (edgeKeys.has(k)) return;
+    edgeKeys.add(k);
+    addEdge(e);
+    inferredEdges++;
+  };
+
+  // count individuals per class for the WebVOWL-style instance numbers
+  const indivCount = new Map<string, number>();
+  typeIndex.forEach((cs) => {
+    cs.forEach((c) => {
+      if (META_TYPES.has(c)) return;
+      const cu = canonical(c);
+      indivCount.set(cu, (indivCount.get(cu) ?? 0) + 1);
+    });
+  });
+
+  for (const s of store.statements) {
+    if (skippedPred(s.predicate.uri) || !isUriNode(s.subject)) continue;
+    const sTypes = (typeIndex.get(s.subject.uri) ?? []).filter((c) => !META_TYPES.has(c));
+    if (!sTypes.length) continue;
+    const pLabel = labelOf(s.predicate.uri) ?? shortName(s.predicate.uri);
+    if (isUriNode(s.object)) {
+      const oTypes = (typeIndex.get(s.object.uri) ?? []).filter((c) => !META_TYPES.has(c));
+      if (!oTypes.length) continue;
+      for (const c1 of sTypes) {
+        for (const c2 of oTypes) {
+          if (s.subject.uri === s.object.uri && c1 === c2) continue;
+          addInferredEdge({
+            source: canonical(c1),
+            target: canonical(c2),
+            kind: "object",
+            label: pLabel,
+          });
+        }
+      }
+    } else if (s.object.termType === "Literal") {
+      const dtUri =
+        (s.object as { datatype?: { uri?: string } }).datatype?.uri ?? RDFS_NS + "Literal";
+      for (const c1 of sTypes) {
+        addInferredEdge({
+          source: canonical(c1),
+          target: datatypeId(dtUri),
+          kind: "datatype",
+          label: pLabel,
+        });
+      }
+    }
+  }
+
+  // stamp instance counts on class nodes
+  nodes.forEach((n) => {
+    if (n.kind === "datatype") return;
+    const c = indivCount.get(n.id);
+    if (c) n.individuals = c;
+  });
+
+  // resolve a human title: owl:Ontology declaration (rdfs:label / dc:title)
+  // → file name
+  const DC = $rdf.Namespace("http://purl.org/dc/elements/1.1/");
+  const ontoDecl = store.statements.find(
+    (s) =>
+      s.predicate.uri === RDF_NS + "type" &&
+      isUriNode(s.subject) &&
+      isUriNode(s.object) &&
+      s.object.uri === OWL_NS + "Ontology"
+  );
+  const ontoUri =
+    ontoDecl && isUriNode(ontoDecl.subject) ? ontoDecl.subject.uri : null;
+  const literalValue = (t: unknown): string | undefined => {
+    const v = t as { termType?: string; value?: string } | null | undefined;
+    return v && v.termType === "Literal" && v.value ? v.value : undefined;
+  };
+  const ontologyTitleOf = (uri: string): string | undefined => {
+    for (const pred of [RDFS("label"), DC("title")]) {
+      const v = literalValue(store.any($rdf.sym(uri), pred));
+      if (v) return v;
+    }
+    return undefined;
+  };
+  let title = "";
+  if (ontoUri) title = ontologyTitleOf(ontoUri) ?? shortName(ontoUri);
+  if (!title) title = fileBase(fileName).replace(/\.[^.]+$/, "");
+  if (!title) title = "IMPORTED ONTOLOGY";
+  const authors = ontoUri
+    ? store
+        .each($rdf.sym(ontoUri), DC("creator"))
+        .map((c) => {
+          const t = c as unknown as { termType?: string; value?: string; uri?: string };
+          return t.termType === "Literal" ? (t.value ?? "") : shortName(t.uri ?? "");
+        })
+        .filter(Boolean)
+        .slice(0, 4)
+    : [];
+
   const meta: OntologyMeta = {
-    iri: baseNs || "imported ontology",
-    title: baseNs ? shortName(baseNs.replace(/[#/]$/, "")) || "IMPORTED ONTOLOGY" : "IMPORTED ONTOLOGY",
+    iri: ontoUri ?? baseNs ?? "imported ontology",
+    title,
+    authors,
     version: "—",
-    authors: [],
-    description: `Imported from RDF (${contentType}) · ${nodes.length} nodes · ${edges.length} edges. External classes reuse other namespaces; equivalence-folded classes show a double ring.`,
+    description:
+      `Imported from RDF (${contentType}) · ${nodes.length} nodes · ${edges.length} edges.` +
+      (inferredEdges > 0
+        ? ` Instance data aggregated to class level (${typeIndex.size} typed individuals, ${inferredEdges} inferred relations).`
+        : " External classes reuse other namespaces; equivalence-folded classes show a double ring."),
   };
 
   if (!edges.length) {
-    throw new ParseError("ontology parsed but contains no properties to display");
+    throw new ParseError(
+      "no displayable content: the file has no property declarations, no subclass/disjoint relations, and no typed instance links"
+    );
   }
   return { nodes, edges, meta };
 }
